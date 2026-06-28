@@ -1,0 +1,15 @@
+[package]
+name = "ergo-stratum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ergo Autolykos2 share validation, Stratum (EthereumStratum/1.0.0) protocol, and per-worker vardiff — reusing the node's own ergo-crypto consensus PoW."
+repository = "https://github.com/arkadianet/ergo-stratum-rs"
+
+[dependencies]
+ergo-crypto = { workspace = true }
+num-bigint  = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+hex         = { workspace = true }
+thiserror   = { workspace = true }

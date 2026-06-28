@@ -1,0 +1,27 @@
+[package]
+name = "ergo-solo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A modern Rust Stratum server for solo GPU mining to any Ergo node (Autolykos2). A single self-contained static binary."
+repository = "https://github.com/arkadianet/ergo-stratum-rs"
+
+[[bin]]
+name = "ergo-solo"
+path = "src/main.rs"
+
+[dependencies]
+ergo-stratum = { path = "../ergo-stratum" }
+
+num-bigint  = { workspace = true }
+hex         = { workspace = true }
+thiserror   = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+tokio       = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "macros", "signal"] }
+tokio-util  = { version = "0.7", features = ["codec"] }
+futures-util = "0.3"
+reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap        = { version = "4", features = ["derive", "env"] }

@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["ergo-stratum", "ergo-solo"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+num-bigint = "0.4"
+serde      = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+hex        = "0.4"
+thiserror  = "2"
+# The Ergo node's OWN consensus Autolykos2 PoW + difficulty, pulled from the public
+# node repo — never a re-implementation, never sigma-rust. Pinned to an exact rev
+# for reproducible builds (HEAD is past the latest v0.4.0 tag; switch to a tag once
+# the node cuts a release containing this commit).
+ergo-crypto = { git = "https://github.com/arkadianet/ergo", rev = "285a3e16d62072d25c6060cbc61620e445736c3d" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
