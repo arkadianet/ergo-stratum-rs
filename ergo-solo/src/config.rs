@@ -54,9 +54,15 @@ pub struct Cli {
     #[arg(long, env = "ERGO_SOLO_BLOCK_VERSION", default_value_t = 3)]
     pub block_version: u8,
 
-    /// Disable per-connection nonce partitioning (give every miner the whole space).
-    #[arg(long, env = "ERGO_SOLO_NO_PARTITION", default_value_t = false)]
-    pub no_partition: bool,
+    /// Enable per-connection nonce partitioning (a 4-byte extraNonce lane per
+    /// worker). OFF by default — this is a *solo* server, so the common case is one
+    /// or a few of your own rigs, and each needs the WHOLE 8-byte nonce space. A
+    /// 4-byte lane is only 2^32 (~4.3e9) nonces; a single mainnet share is ~1e11
+    /// nonces, so a lane STARVES the miner (it exhausts its slice in seconds, finds
+    /// almost nothing, and floods stale rejects). Enable ONLY when running many rigs
+    /// against this server that must not grind overlapping nonce ranges.
+    #[arg(long, env = "ERGO_SOLO_PARTITION", default_value_t = false)]
+    pub partition: bool,
 
     /// Initial vardiff factor (share_target = network_target × factor; bigger =
     /// easier). Overrides the network default.
@@ -143,11 +149,50 @@ impl Config {
             api_key: cli.api_key,
             poll_interval: Duration::from_secs(cli.poll_secs.max(1)),
             block_version: cli.block_version,
-            partition_nonce: !cli.no_partition,
+            partition_nonce: cli.partition,
             vardiff,
             max_msgs_per_sec: cli.max_msgs_per_sec,
             max_connections: cli.max_connections,
             max_conns_per_ip: cli.max_conns_per_ip,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(args: &[&str]) -> Config {
+        let mut argv = vec!["ergo-solo"];
+        argv.extend_from_slice(args);
+        Config::from_cli(Cli::parse_from(argv))
+    }
+
+    // Regression guard for the incident that motivated the default flip: a 4-byte
+    // partition lane (2^32 nonces) is smaller than one mainnet share (~1e11), so a
+    // single solo rig is starved. The resolved default MUST be whole-space.
+    #[test]
+    fn partitioning_is_off_by_default() {
+        assert!(!cfg(&[]).partition_nonce, "solo default must be whole-space");
+        assert!(!cfg(&["--network", "mainnet"]).partition_nonce);
+    }
+
+    #[test]
+    fn partition_flag_opts_into_per_worker_lanes() {
+        assert!(cfg(&["--partition"]).partition_nonce, "--partition enables lanes");
+    }
+
+    #[test]
+    fn network_selects_the_default_vardiff_envelope() {
+        let m = cfg(&["--network", "mainnet"]).vardiff;
+        assert_eq!((m.initial, m.min, m.max), (1_000, 64, 10_000_000));
+        let t = cfg(&["--network", "testnet"]).vardiff;
+        assert_eq!((t.initial, t.min, t.max), (1, 1, 8));
+    }
+
+    #[test]
+    fn explicit_vardiff_flags_override_the_network_default() {
+        let v = cfg(&["--network", "mainnet", "--vardiff-initial", "42"]).vardiff;
+        assert_eq!(v.initial, 42, "explicit --vardiff-initial wins over the default");
     }
 }
