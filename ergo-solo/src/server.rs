@@ -146,8 +146,14 @@ pub async fn run(config: Config) -> std::io::Result<()> {
     let next_session = Arc::new(AtomicU64::new(1));
     let admission = Admission::new(config.max_connections, config.max_conns_per_ip);
 
-    tokio::spawn(poll_candidates(node.clone(), config.clone(), job_tx));
-    tokio::spawn(submit_blocks(node.clone(), share_rx));
+    // Keep the handles: these are forever-loops, so if either ever *ends* (a panic
+    // inside the task) the process is silently broken — the poller's death drops the
+    // job channel and every miner instant-disconnects (`job_rx.changed()` -> Err),
+    // and the submitter's death means found blocks never reach the node. A
+    // live-but-wedged process is invisible to a `Restart=` supervisor, so we watch
+    // both below and exit non-zero to force a clean restart.
+    let mut poll_task = tokio::spawn(poll_candidates(node.clone(), config.clone(), job_tx));
+    let mut submit_task = tokio::spawn(submit_blocks(node.clone(), share_rx));
 
     let listener = TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(
@@ -164,6 +170,14 @@ pub async fn run(config: Config) -> std::io::Result<()> {
             _ = &mut shutdown => {
                 tracing::info!("shutdown signal received — stopping accept loop");
                 return Ok(());
+            }
+            outcome = &mut poll_task => {
+                tracing::error!(?outcome, "candidate poller task ended — exiting so the supervisor restarts a clean process");
+                return Err(std::io::Error::other("candidate poller task ended unexpectedly"));
+            }
+            outcome = &mut submit_task => {
+                tracing::error!(?outcome, "block submitter task ended — exiting so the supervisor restarts a clean process");
+                return Err(std::io::Error::other("block submitter task ended unexpectedly"));
             }
             accept = listener.accept() => accept,
         };
@@ -315,9 +329,15 @@ impl Connection {
                         tracing::debug!("dropping connection: inbound control-message rate exceeded");
                         return Ok(());
                     }
+                    // Raw frame tracing lives at TRACE, not DEBUG: it's high-volume
+                    // (every frame, per GPU) and a `mining.authorize` line carries the
+                    // worker's login/password verbatim — keep it out of the per-share
+                    // DEBUG stream and behind an explicit opt-in.
+                    tracing::trace!(session_id = self.session_id, frame = %line, "→ inbound");
                     let now = self.start.elapsed().as_secs_f64();
                     let result = handle_line(&mut self.session, self.session_id, &line, now);
                     for frame in &result.replies {
+                        tracing::trace!(session_id = self.session_id, frame = %frame.trim_end(), "← reply");
                         write.write_all(frame.as_bytes()).await?;
                     }
                     if result.just_authorized {
@@ -397,5 +417,22 @@ mod tests {
         assert!(a.try_admit(ip).is_none(), "3rd from the same IP refused");
         drop(t2);
         assert!(a.try_admit(ip).is_some(), "a freed per-IP slot is reusable");
+    }
+
+    // The supervision mechanism `run()` relies on: a spawned forever-task that dies
+    // (panics) resolves its JoinHandle to Err, so a `select!` on `&mut handle` fires
+    // — that's what lets `run()` exit non-zero for a supervised restart instead of
+    // lingering as a live-but-wedged process (job channel dead, miners flapping).
+    #[tokio::test]
+    async fn a_dead_background_task_is_observable_via_its_join_handle() {
+        let mut task = tokio::spawn(async { panic!("simulated poller death") });
+        let fired_on_death = tokio::select! {
+            outcome = &mut task => outcome.is_err(), // JoinError from the panic
+            _ = tokio::time::sleep(Duration::from_secs(5)) => false, // timed out => not observed
+        };
+        assert!(
+            fired_on_death,
+            "a panicked task must resolve its handle to Err so run() can react"
+        );
     }
 }

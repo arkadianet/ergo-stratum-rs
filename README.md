@@ -88,8 +88,25 @@ Every flag has an `ERGO_SOLO_*` environment equivalent.
 | `--vardiff-initial/min/max` | network-based | override the share-difficulty envelope |
 | `--max-msgs-per-sec` | `0` (off) | control-message flood cap (share submits are never counted) |
 | `--max-connections` | `1024` | global connection cap |
+| `--partition` | off | split the nonce space into per-worker 4-byte lanes — only for a **multi-rig farm** (see below) |
 
 Logging: `RUST_LOG=debug ergo-solo …` for per-share detail.
+
+### One rig vs. a farm (`--partition`)
+
+By default every connection is handed the **whole 8-byte nonce space**. That is
+what a single rig needs: a mainnet share is on the order of 10¹¹ nonce attempts,
+and partitioning would carve a worker down to a 4-byte lane (only ~4.3×10⁹ nonces)
+— smaller than one share, so the miner exhausts its slice in seconds, finds almost
+nothing, and floods stale rejects. Only turn `--partition` **on** when several rigs
+share this one server and you want them grinding disjoint ranges instead of
+overlapping. (Whole-space overlap between a couple of your own rigs just wastes a
+little duplicate work — never wrong for solo.)
+
+> **Migration:** partitioning used to be **on** by default (flag `--no-partition` /
+> env `ERGO_SOLO_NO_PARTITION`). It is now **off** by default and the flag is
+> `--partition` (env `ERGO_SOLO_PARTITION=true`). A multi-rig farm that relied on the
+> old default must now pass `--partition` explicitly.
 
 ## How it works
 
