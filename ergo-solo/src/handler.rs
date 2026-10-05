@@ -335,6 +335,27 @@ mod tests {
     }
 
     #[test]
+    fn reauthorizing_as_a_different_worker_fails_so_the_server_closes() {
+        let mut s = session();
+        handshake(&mut s); // authorized as wallet.rig
+        let same = handle_line(
+            &mut s,
+            &ctx(),
+            r#"{"id":3,"method":"mining.authorize","params":["wallet.rig"]}"#,
+            0.0,
+        );
+        assert!(same.just_authorized && !same.auth_failed);
+        let other = handle_line(
+            &mut s,
+            &ctx(),
+            r#"{"id":4,"method":"mining.authorize","params":["fresh.identity"]}"#,
+            0.0,
+        );
+        assert!(other.auth_failed && !other.just_authorized);
+        assert_eq!(s.worker(), Some("wallet.rig"));
+    }
+
+    #[test]
     fn extranonce_subscribe_is_acknowledged() {
         let mut s = session();
         let r = handle_line(

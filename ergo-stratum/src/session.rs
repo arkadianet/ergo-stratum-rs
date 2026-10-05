@@ -201,8 +201,15 @@ impl Session {
     /// Handle `mining.authorize` for `worker`. Requires a prior subscribe.
     /// Returns whether authorization succeeded. (Credential checks are the
     /// caller's policy; this only enforces the handshake order.)
+    ///
+    /// A connection's identity is fixed once authorized: re-authorizing under
+    /// the same name is accepted (idempotent), under a different name refused —
+    /// otherwise one socket could mint unlimited worker identities.
     pub fn authorize(&mut self, worker: &str) -> bool {
         if self.state == SessionState::Connected || worker.is_empty() {
+            return false;
+        }
+        if self.worker.as_deref().is_some_and(|w| w != worker) {
             return false;
         }
         self.worker = Some(worker.to_string());
@@ -420,6 +427,18 @@ mod tests {
         let s = authed();
         assert_eq!(s.state(), SessionState::Authorized);
         assert_eq!(s.worker(), Some("miner.worker1"));
+    }
+
+    #[test]
+    fn reauthorizing_keeps_the_identity_fixed() {
+        let mut s = authed();
+        assert!(
+            s.authorize("miner.worker1"),
+            "same name again is idempotent"
+        );
+        assert!(!s.authorize("someone.else"), "a different name is refused");
+        assert_eq!(s.worker(), Some("miner.worker1"));
+        assert_eq!(s.state(), SessionState::Authorized);
     }
 
     #[test]

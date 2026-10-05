@@ -760,7 +760,7 @@ impl Connection {
                 tracing::debug!(%worker, ?outcome, "share graded");
                 self.stats.record_submit(worker, outcome, Instant::now());
             } else if result.invalid {
-                self.stats.record_invalid(worker);
+                self.stats.record_invalid(worker, Instant::now());
             }
         }
 
@@ -788,10 +788,10 @@ impl Connection {
         // 5. A fresh login gets the current job straight away.
         if result.just_authorized {
             let worker = self.session.worker().unwrap_or_default().to_string();
-            if self.worker.as_deref() != Some(worker.as_str()) {
-                if let Some(old) = self.worker.replace(worker.clone()) {
-                    self.stats.worker_disconnected(&old);
-                }
+            // The session refuses a rename, so this only fires on first login
+            // (a same-name re-authorize is already counted).
+            if self.worker.is_none() {
+                self.worker = Some(worker.clone());
                 self.stats.worker_connected(&worker, Instant::now());
             }
             tracing::info!(

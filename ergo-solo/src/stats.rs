@@ -20,6 +20,14 @@ use ergo_stratum::session::{RejectReason, SubmitOutcome};
 /// Window for the "recent" hashrate estimate.
 pub const RECENT_WINDOW: Duration = Duration::from_secs(600);
 
+/// Most worker entries kept. Past it, a worker with no live connection is
+/// forgotten — one that never had an accepted share first (junk logins can't
+/// fake those without real hashing), else the least recently active — so
+/// connect/authorize/disconnect churn under ever-new names can't grow memory
+/// without bound or push out real workers' totals. (Workers with a live
+/// connection are never evicted; those are bounded by `--max-connections`.)
+pub const MAX_TRACKED_WORKERS: usize = 4096;
+
 /// Shared statistics registry (wrap in an `Arc`).
 #[derive(Debug)]
 pub struct Stats {
@@ -30,8 +38,35 @@ pub struct Stats {
 struct Inner {
     started: Instant,
     workers: BTreeMap<String, Worker>,
+    max_workers: usize,
     blocks: BlockCounts,
     node: NodeHealth,
+}
+
+impl Inner {
+    /// The entry for `name`, created (making room if needed) on first sight.
+    fn worker_mut(&mut self, name: &str, now: Instant) -> &mut Worker {
+        if !self.workers.contains_key(name) && self.workers.len() >= self.max_workers {
+            self.evict_one_idle();
+        }
+        let w = self.workers.entry(name.to_string()).or_default();
+        w.first_seen.get_or_insert(now);
+        w
+    }
+
+    /// Forget one disconnected worker: workless ones first, then the least
+    /// recently active. No-op if every tracked worker is connected.
+    fn evict_one_idle(&mut self) {
+        let victim = self
+            .workers
+            .iter()
+            .filter(|(_, w)| w.connections == 0)
+            .min_by_key(|(_, w)| (w.counts.accepted > 0, w.last_share.or(w.first_seen)))
+            .map(|(name, _)| name.clone());
+        if let Some(name) = victim {
+            self.workers.remove(&name);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -120,10 +155,15 @@ impl Default for Stats {
 
 impl Stats {
     pub fn new(now: Instant) -> Self {
+        Self::with_max_workers(now, MAX_TRACKED_WORKERS)
+    }
+
+    fn with_max_workers(now: Instant, max_workers: usize) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 started: now,
                 workers: BTreeMap::new(),
+                max_workers: max_workers.max(1),
                 blocks: BlockCounts::default(),
                 node: NodeHealth::default(),
             }),
@@ -137,13 +177,10 @@ impl Stats {
 
     /// A connection authorized as `worker`.
     pub fn worker_connected(&self, worker: &str, now: Instant) {
-        let mut g = self.lock();
-        let w = g.workers.entry(worker.to_string()).or_default();
-        w.connections += 1;
-        w.first_seen.get_or_insert(now);
+        self.lock().worker_mut(worker, now).connections += 1;
     }
 
-    /// A connection authorized as `worker` closed (or re-authorized as another).
+    /// A connection authorized as `worker` closed.
     pub fn worker_disconnected(&self, worker: &str) {
         if let Some(w) = self.lock().workers.get_mut(worker) {
             w.connections = w.connections.saturating_sub(1);
@@ -153,8 +190,7 @@ impl Stats {
     /// Record a graded submission.
     pub fn record_submit(&self, worker: &str, outcome: &SubmitOutcome, now: Instant) {
         let mut g = self.lock();
-        let w = g.workers.entry(worker.to_string()).or_default();
-        w.first_seen.get_or_insert(now);
+        let w = g.worker_mut(worker, now);
         match *outcome {
             SubmitOutcome::Accepted { weight, .. } | SubmitOutcome::Block { weight, .. } => {
                 w.counts.accepted += 1;
@@ -176,14 +212,9 @@ impl Stats {
         }
     }
 
-    /// Record a malformed line from `worker` (or an unauthenticated peer).
-    pub fn record_invalid(&self, worker: &str) {
-        self.lock()
-            .workers
-            .entry(worker.to_string())
-            .or_default()
-            .counts
-            .invalid += 1;
+    /// Record a malformed line from an authorized `worker`.
+    pub fn record_invalid(&self, worker: &str, now: Instant) {
+        self.lock().worker_mut(worker, now).counts.invalid += 1;
     }
 
     pub fn block_found(&self) {
@@ -341,7 +372,7 @@ mod tests {
         ] {
             s.record_submit("rig", &SubmitOutcome::Rejected(reason), t0);
         }
-        s.record_invalid("rig");
+        s.record_invalid("rig", t0);
         let w = &s.snapshot(t0).workers[0];
         assert_eq!(
             w.counts,
@@ -378,6 +409,46 @@ mod tests {
         assert_eq!(w.connections, 1);
         assert_eq!((w.counts.accepted, w.counts.blocks), (2, 1));
         assert_eq!(w.work_hashes, 10.0);
+    }
+
+    #[test]
+    fn worker_map_is_bounded_by_evicting_idle_disconnected_workers() {
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let s = Stats::with_max_workers(t0, 3);
+        // A live worker and a disconnected one with recent work.
+        s.worker_connected("live", at(0));
+        s.worker_connected("paid", at(0));
+        s.record_submit("paid", &accepted(7), at(50));
+        s.worker_disconnected("paid");
+        // Churn: connect/disconnect under ever-new names.
+        for i in 0..100 {
+            let name = format!("junk{i}");
+            s.worker_connected(&name, at(100 + i)); // all newer than paid's share
+            s.worker_disconnected(&name);
+        }
+        let snap = s.snapshot(at(300));
+        let names: Vec<_> = snap.workers.iter().map(|w| w.worker.as_str()).collect();
+        assert_eq!(snap.workers.len(), 3, "{names:?}");
+        assert!(
+            names.contains(&"live"),
+            "a connected worker is never evicted"
+        );
+        assert!(
+            names.contains(&"paid"),
+            "real work outlives any amount of junk churn"
+        );
+    }
+
+    #[test]
+    fn a_full_map_of_connected_workers_still_admits_a_new_one() {
+        // Live workers are bounded by the connection cap, not this map.
+        let t0 = Instant::now();
+        let s = Stats::with_max_workers(t0, 2);
+        for name in ["a", "b", "c"] {
+            s.worker_connected(name, t0);
+        }
+        assert_eq!(s.snapshot(t0).workers.len(), 3);
     }
 
     #[test]
