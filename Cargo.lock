@@ -385,6 +385,7 @@ dependencies = [
  "ergo-crypto",
  "hex",
  "num-bigint",
+ "num-traits",
  "serde",
  "serde_json",
  "thiserror",

@@ -16,6 +16,12 @@
 //! - `mining.submit` params `[worker, job_id, extraNonce2, ntime, full_nonce]` —
 //!   the full 8-byte nonce is at index 4 (we grade *that*; the extraNonce2 slice
 //!   at index 2 is redundant given the full nonce).
+//! - `mining.set_difficulty` precedes every `mining.notify` (pools are expected
+//!   to "set the difficulty"; rental proxies check for it). Its value is `1` —
+//!   the share target is already in the notify — except for NiceHash, which
+//!   reads difficulty in its own units ([`nicehash_difficulty`]). This is the
+//!   Miningcore Ergo convention; `1` is also the only value on which the two
+//!   competing Ergo conventions (multiply-the-target vs. Diff1/target) agree.
 //! - `mining.set_extranonce` re-keys the lane mid-session;
 //!   `mining.extranonce.subscribe` is acknowledged so proxies that ask for it
 //!   (NiceHash-style) don't treat the pool as broken.
@@ -28,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use num_bigint::BigUint;
+use num_traits::ToPrimitive;
 
 use crate::job::Job;
 
@@ -310,6 +317,40 @@ pub fn notify(job_id: u64, job: &Job, boundary: &BigUint, clean: bool) -> Notifi
     }
 }
 
+/// `mining.set_difficulty` with `difficulty`. Integral values are sent as JSON
+/// integers (`[1]`, exactly as Miningcore sends it), others as floats.
+pub fn set_difficulty(difficulty: f64) -> Notification {
+    let value = if difficulty.fract() == 0.0 && (0.0..9.0e15).contains(&difficulty) {
+        json!(difficulty as u64)
+    } else {
+        json!(difficulty)
+    };
+    Notification {
+        method: "mining.set_difficulty".to_string(),
+        params: json!([value]),
+    }
+}
+
+/// The difficulty NiceHash expects for a share `target`: Miningcore's
+/// `Diff1 / target × 2^32` with Bitcoin's `Diff1 = 0xffff·2^208`, i.e.
+/// `0xffff·2^240 / target` — within 0.002% of the expected hashes per share.
+pub fn nicehash_difficulty(target: &BigUint) -> f64 {
+    let numerator: BigUint = BigUint::from(0xffffu32) << 240usize;
+    let numerator = numerator.to_f64().unwrap_or(f64::MAX);
+    let target = target.to_f64().filter(|t| *t >= 1.0).unwrap_or(1.0);
+    numerator / target
+}
+
+/// MiningRigRentals' Autolykos difficulty for a share `target`: expected hashes
+/// per share in units of 2^31, i.e. `2^225 / target`. Verified against MRR's
+/// rental dashboard, which displays exactly this for a pool's share target.
+pub fn mrr_difficulty(target: &BigUint) -> f64 {
+    let numerator: BigUint = BigUint::from(1u8) << 225usize;
+    let numerator = numerator.to_f64().unwrap_or(f64::MAX);
+    let target = target.to_f64().filter(|t| *t >= 1.0).unwrap_or(1.0);
+    numerator / target
+}
+
 /// `mining.set_extranonce` — re-key the connection's nonce lane mid-session.
 pub fn set_extranonce(extra_nonce1: &str, extra_nonce2_bytes: usize) -> Notification {
     Notification {
@@ -549,6 +590,41 @@ mod tests {
         // result[1]/result[2] are what the miner reads for nonce partitioning.
         assert_eq!(v["result"][1], "deadbeef");
         assert_eq!(v["result"][2], 4);
+    }
+
+    #[test]
+    fn set_difficulty_one_is_an_integer_like_miningcore_sends_it() {
+        let v: Value = serde_json::from_str(set_difficulty(1.0).to_line().trim()).unwrap();
+        assert_eq!(v["method"], "mining.set_difficulty");
+        assert_eq!(v["params"], json!([1]));
+        assert!(v["params"][0].is_u64(), "1, not 1.0");
+        assert_eq!(v["id"], Value::Null);
+        let v: Value = serde_json::from_str(set_difficulty(2.5).to_line().trim()).unwrap();
+        assert_eq!(v["params"][0], 2.5);
+    }
+
+    #[test]
+    fn nicehash_difficulty_is_about_the_expected_hashes_per_share() {
+        // A share target of 2^256 / 7e10 takes ~7e10 hashes to meet.
+        let target = (BigUint::from(1u8) << 256) / BigUint::from(70_000_000_000u64);
+        let d = nicehash_difficulty(&target);
+        assert!((d / 7e10 - 1.0).abs() < 1e-4, "{d}");
+        // Harder target -> proportionally higher difficulty.
+        let harder = nicehash_difficulty(&(&target / BigUint::from(4u8)));
+        assert!((harder / d - 4.0).abs() < 1e-6);
+        // Degenerate input doesn't panic.
+        assert!(nicehash_difficulty(&BigUint::from(0u8)) > 0.0);
+    }
+
+    #[test]
+    fn mrr_difficulty_counts_expected_hashes_in_units_of_2_pow_31() {
+        // The exact figure MRR displayed for a live share target (network target
+        // at difficulty ~6.95e13, vardiff factor 1000) is 32.367578125; any
+        // target T gives (2^256 / T) / 2^31.
+        let target = (BigUint::from(1u8) << 256) / BigUint::from(70_000_000_000u64);
+        let d = mrr_difficulty(&target);
+        assert!((d - 70_000_000_000.0 / 2f64.powi(31)).abs() < 1e-6, "{d}");
+        assert!(mrr_difficulty(&BigUint::from(0u8)) > 0.0);
     }
 
     #[test]
