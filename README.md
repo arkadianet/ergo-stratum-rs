@@ -91,6 +91,7 @@ Every flag has an `ERGO_SOLO_*` environment equivalent.
 | `--vardiff-interval` | `15` | target seconds between shares per worker |
 | `--stratum-password` | — | require this password in `mining.authorize`; set it before exposing the port |
 | `--no-set-difficulty` | off | stop sending `mining.set_difficulty` before each job (see below) |
+| `--set-difficulty-value` | `one` | `one`, or `mrr`: announce the share difficulty in MiningRigRentals' units (use on a rental instance) |
 | `--max-msgs-per-sec` | `0` (off) | control-message flood cap (share submits are never counted) |
 | `--max-invalid-per-min` | `0` (off) | drop a connection sending more invalid shares than this per minute (stale shares don't count) |
 | `--max-connections` | `1024` | global connection cap |
@@ -191,6 +192,12 @@ convention the value is `1`, because the real share target is already in the
 job; a client that announces itself as NiceHash instead gets the share
 difficulty in NiceHash's units. `--no-set-difficulty` turns this off if a miner
 ever misbehaves on receiving it.
+
+For a MiningRigRentals rental, run a separate instance with
+`--set-difficulty-value mrr`: it announces the real share difficulty in MRR's
+units (expected hashes per share ÷ 2³¹ — exactly what MRR's dashboard displays).
+With `1`, MRR flags the rental "Low Worker Difficulty", since 1 is far below the
+rig's optimal range.
 
 Caveats: compatibility with NiceHash / MiningRigRentals proxies is still to be
 proven end-to-end (run their pool checkers, then a short rental, and compare the

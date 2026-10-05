@@ -341,6 +341,16 @@ pub fn nicehash_difficulty(target: &BigUint) -> f64 {
     numerator / target
 }
 
+/// MiningRigRentals' Autolykos difficulty for a share `target`: expected hashes
+/// per share in units of 2^31, i.e. `2^225 / target`. Verified against MRR's
+/// rental dashboard, which displays exactly this for a pool's share target.
+pub fn mrr_difficulty(target: &BigUint) -> f64 {
+    let numerator: BigUint = BigUint::from(1u8) << 225usize;
+    let numerator = numerator.to_f64().unwrap_or(f64::MAX);
+    let target = target.to_f64().filter(|t| *t >= 1.0).unwrap_or(1.0);
+    numerator / target
+}
+
 /// `mining.set_extranonce` — re-key the connection's nonce lane mid-session.
 pub fn set_extranonce(extra_nonce1: &str, extra_nonce2_bytes: usize) -> Notification {
     Notification {
@@ -604,6 +614,17 @@ mod tests {
         assert!((harder / d - 4.0).abs() < 1e-6);
         // Degenerate input doesn't panic.
         assert!(nicehash_difficulty(&BigUint::from(0u8)) > 0.0);
+    }
+
+    #[test]
+    fn mrr_difficulty_counts_expected_hashes_in_units_of_2_pow_31() {
+        // The exact figure MRR displayed for a live share target (network target
+        // at difficulty ~6.95e13, vardiff factor 1000) is 32.367578125; any
+        // target T gives (2^256 / T) / 2^31.
+        let target = (BigUint::from(1u8) << 256) / BigUint::from(70_000_000_000u64);
+        let d = mrr_difficulty(&target);
+        assert!((d - 70_000_000_000.0 / 2f64.powi(31)).abs() < 1e-6, "{d}");
+        assert!(mrr_difficulty(&BigUint::from(0u8)) > 0.0);
     }
 
     #[test]

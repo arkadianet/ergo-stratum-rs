@@ -32,11 +32,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::codec::{FramedRead, LinesCodec};
 
-use ergo_stratum::protocol::{nicehash_difficulty, notify, set_difficulty};
+use ergo_stratum::protocol::{mrr_difficulty, nicehash_difficulty, notify, set_difficulty};
 use ergo_stratum::session::SessionState;
 use ergo_stratum::{Assignment, ExtraNonce, Job, LanePool, Session};
 
-use crate::config::Config;
+use crate::config::{Config, DifficultyValue};
 use crate::handler::{handle_line, FoundBlock, LineCtx};
 use crate::job_source::JobSource;
 use crate::node::{NodeClient, NodeError};
@@ -324,6 +324,7 @@ pub async fn serve(
             invalid: RateLimiter::new(config.max_invalid_per_min, Duration::from_secs(60), now),
             worker: None,
             send_difficulty: config.set_difficulty,
+            difficulty_value: config.set_difficulty_value,
         };
         tokio::spawn(async move {
             // Released when the task ends.
@@ -635,8 +636,10 @@ struct Connection {
     invalid: RateLimiter,
     /// The login this connection is counted under in [`Stats`].
     worker: Option<String>,
-    /// Precede every job with `mining.set_difficulty`.
+    /// Precede every job with `mining.set_difficulty`...
     send_difficulty: bool,
+    /// ...announcing this.
+    difficulty_value: DifficultyValue,
 }
 
 /// Which `mining.set_difficulty` (if any) precedes a job.
@@ -647,6 +650,8 @@ enum DifficultyMsg {
     Unit,
     /// NiceHash units, derived from the job's share target.
     NiceHash,
+    /// MiningRigRentals units, derived from the job's share target.
+    Mrr,
 }
 
 impl Connection {
@@ -667,6 +672,8 @@ impl Connection {
             DifficultyMsg::Off
         } else if self.session.is_nicehash() {
             DifficultyMsg::NiceHash
+        } else if self.difficulty_value == DifficultyValue::Mrr {
+            DifficultyMsg::Mrr
         } else {
             DifficultyMsg::Unit
         }
@@ -871,6 +878,7 @@ async fn send_job(
         DifficultyMsg::Off => String::new(),
         DifficultyMsg::Unit => set_difficulty(1.0).to_line(),
         DifficultyMsg::NiceHash => set_difficulty(nicehash_difficulty(&boundary)).to_line(),
+        DifficultyMsg::Mrr => set_difficulty(mrr_difficulty(&boundary)).to_line(),
     };
     frames.push_str(&notify(a.id, &a.job, &boundary, a.clean).to_line());
     write_frame(write, &frames).await
@@ -1105,6 +1113,7 @@ mod e2e {
             },
             stratum_password: None,
             set_difficulty: true,
+            set_difficulty_value: DifficultyValue::One,
             max_msgs_per_sec: 0,
             max_invalid_per_min: 0,
             max_connections: 16,
@@ -1257,6 +1266,25 @@ mod e2e {
             (num_bigint::BigUint::from(1u8) << 256u32) * num_bigint::BigUint::from(1000u32);
         let want = nicehash_difficulty(&share_target);
         assert!((d / want - 1.0).abs() < 1e-9, "{d} vs {want}");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_mrr_instance_announces_the_share_difficulty_in_mrr_units() {
+        let node = Arc::new(MockNode::default());
+        *node.candidate.lock().unwrap() = Some(candidate_body());
+        let mut config = test_config(spawn_mock_node(node.clone()).await);
+        config.set_difficulty_value = DifficultyValue::Mrr;
+        let server = start_server(config).await;
+        let mut miner = Miner::connect(server.addr).await;
+        let frames = miner.handshake_as("MRR-Hash/1.0.0").await;
+        let set = &frames[frames.len() - 2];
+        assert_eq!(set["method"], "mining.set_difficulty");
+        let share_target =
+            (num_bigint::BigUint::from(1u8) << 256u32) * num_bigint::BigUint::from(1000u32);
+        let want = mrr_difficulty(&share_target);
+        let got = set["params"][0].as_f64().unwrap();
+        assert!((got / want - 1.0).abs() < 1e-9, "{got} vs {want}");
         server.shutdown().await;
     }
 

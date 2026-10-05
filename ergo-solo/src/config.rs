@@ -22,6 +22,19 @@ pub enum Network {
     Testnet,
 }
 
+/// The value announced in `mining.set_difficulty` (NiceHash clients always get
+/// NiceHash units).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum DifficultyValue {
+    /// `1` — the share target is in the job itself (Miningcore convention; what
+    /// GPU miners connecting directly expect).
+    One,
+    /// The share difficulty in MiningRigRentals' units (expected hashes per
+    /// share / 2^31) — for an instance serving MRR rentals, whose dashboard
+    /// flags anything below the rig's optimal range as "Low Worker Difficulty".
+    Mrr,
+}
+
 /// A modern Rust Stratum server for solo GPU mining to an Ergo node (Autolykos2).
 ///
 /// It polls the node's `/mining/candidate`, serves work to GPU miners (Rigel,
@@ -119,6 +132,12 @@ pub struct Cli {
     #[arg(long, env = "ERGO_SOLO_NO_SET_DIFFICULTY", default_value_t = false)]
     pub no_set_difficulty: bool,
 
+    /// What `mining.set_difficulty` announces: `one` (default) or `mrr` (the
+    /// share difficulty in MiningRigRentals' units — use on a rental instance).
+    #[arg(long, env = "ERGO_SOLO_SET_DIFFICULTY_VALUE", value_enum,
+          default_value_t = DifficultyValue::One)]
+    pub set_difficulty_value: DifficultyValue,
+
     /// Inbound non-share message flood cap per second (0 = off, the solo default —
     /// share submissions are never counted, vardiff governs those).
     #[arg(long, env = "ERGO_SOLO_MAX_MSGS_PER_SEC", default_value_t = 0)]
@@ -182,6 +201,8 @@ pub struct Config {
     pub stratum_password: Option<String>,
     /// Send `mining.set_difficulty` before every `mining.notify`.
     pub set_difficulty: bool,
+    /// What that `mining.set_difficulty` announces.
+    pub set_difficulty_value: DifficultyValue,
     pub max_msgs_per_sec: u32,
     pub max_invalid_per_min: u32,
     pub max_connections: usize,
@@ -239,6 +260,7 @@ impl Config {
             vardiff,
             stratum_password: cli.stratum_password.filter(|p| !p.is_empty()),
             set_difficulty: !cli.no_set_difficulty,
+            set_difficulty_value: cli.set_difficulty_value,
             max_msgs_per_sec: cli.max_msgs_per_sec,
             max_invalid_per_min: cli.max_invalid_per_min,
             max_connections: cli.max_connections,
@@ -334,6 +356,11 @@ mod tests {
     fn set_difficulty_is_on_by_default_and_can_be_disabled() {
         assert!(cfg(&[]).set_difficulty);
         assert!(!cfg(&["--no-set-difficulty"]).set_difficulty);
+        assert_eq!(cfg(&[]).set_difficulty_value, DifficultyValue::One);
+        assert_eq!(
+            cfg(&["--set-difficulty-value", "mrr"]).set_difficulty_value,
+            DifficultyValue::Mrr
+        );
     }
 
     #[test]
