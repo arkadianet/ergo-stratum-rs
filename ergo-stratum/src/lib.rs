@@ -22,9 +22,9 @@ pub mod session;
 pub mod share;
 pub mod vardiff;
 
-pub use extranonce::ExtraNonce;
+pub use extranonce::{ExtraNonce, LanePool};
 pub use job::{share_weight, Job};
 pub use protocol::{parse_inbound, Inbound, Notification, ProtocolError, Request, Response};
-pub use session::{RejectReason, Session, SessionState, SessionStats, SubmitOutcome};
+pub use session::{Assignment, RejectReason, Session, SessionState, SessionStats, SubmitOutcome};
 pub use share::{classify, classify_hit, ShareClass, Submission};
 pub use vardiff::VarDiff;

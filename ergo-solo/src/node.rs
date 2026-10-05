@@ -1,5 +1,6 @@
 //! Minimal async Ergo-node client for the mining endpoints the daemon needs:
-//! `GET /mining/candidate` (work) and `POST /mining/solution` (block submit).
+//! `GET /mining/candidate` (work, optionally long-polled) and
+//! `POST /mining/solution` (block submit).
 //!
 //! The candidate's target `b` is a ~256-bit integer that overflows `u64`; default
 //! `serde_json` would parse it lossily into an `f64`. We sidestep that without the
@@ -17,7 +18,7 @@ use serde_json::value::RawValue;
 pub struct Candidate {
     /// 32-byte header message to solve.
     pub msg: [u8; 32],
-    /// Network target `b` (a real block needs `hit <= target`).
+    /// Network target `b` (a real block needs `hit < target`).
     pub target: BigUint,
     /// Candidate height (sets the Autolykos2 table size N).
     pub height: u32,
@@ -36,6 +37,24 @@ pub enum NodeError {
     #[error("malformed candidate: {0}")]
     Parse(String),
 }
+
+impl NodeError {
+    /// Worth retrying: the request may never have reached the node, or the node
+    /// was momentarily unable to serve it (`5xx`, `429`). A `4xx` is a verdict on
+    /// the request itself (e.g. `invalid_pow`, `stale_candidate`) and retrying
+    /// can't change it.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            NodeError::Http(_) => true,
+            NodeError::Status { status, .. } => *status >= 500 || *status == 429,
+            NodeError::Parse(_) => false,
+        }
+    }
+}
+
+/// How long a long-poll request may stay parked server-side before we give up
+/// on it. The Rust node answers within 30s; this leaves headroom.
+const LONGPOLL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// Parse a `/mining/candidate` response body into a [`Candidate`].
 ///
@@ -128,9 +147,23 @@ impl NodeClient {
     }
 
     /// Fetch the current mining candidate.
-    pub async fn candidate(&self) -> Result<Candidate, NodeError> {
+    ///
+    /// With `longpoll = Some(msg)` (the template we already hold) the request is
+    /// `GET /mining/candidate?longpoll=<msg>`: a node that supports it parks the
+    /// request until its template changes (or ~30s pass), so new work arrives the
+    /// instant it exists. Nodes without long-poll ignore the parameter and answer
+    /// immediately, so the caller's normal poll cadence still applies.
+    pub async fn candidate(&self, longpoll: Option<&[u8; 32]>) -> Result<Candidate, NodeError> {
+        let req = match longpoll {
+            Some(msg) => self
+                .http
+                .get(&self.candidate_url)
+                .query(&[("longpoll", hex::encode(msg))])
+                .timeout(LONGPOLL_REQUEST_TIMEOUT),
+            None => self.http.get(&self.candidate_url),
+        };
         let resp = self
-            .auth(self.http.get(&self.candidate_url))
+            .auth(req)
             .send()
             .await
             .map_err(|e| NodeError::Http(e.to_string()))?;
@@ -233,6 +266,24 @@ mod tests {
     fn wrong_length_msg_is_rejected() {
         let body = r#"{"msg":"0102","b":5,"h":1}"#;
         assert!(matches!(parse_candidate(body), Err(NodeError::Parse(_))));
+    }
+
+    #[test]
+    fn transient_errors_are_transport_and_server_side_only() {
+        assert!(NodeError::Http("connection refused".into()).is_transient());
+        let status = |status| NodeError::Status {
+            status,
+            body: String::new(),
+        };
+        assert!(status(503).is_transient());
+        assert!(status(504).is_transient());
+        assert!(status(429).is_transient());
+        assert!(
+            !status(400).is_transient(),
+            "invalid_pow / stale_candidate are final"
+        );
+        assert!(!status(403).is_transient());
+        assert!(!NodeError::Parse("x".into()).is_transient());
     }
 
     #[test]

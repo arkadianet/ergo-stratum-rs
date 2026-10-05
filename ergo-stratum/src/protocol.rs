@@ -16,7 +16,13 @@
 //! - `mining.submit` params `[worker, job_id, extraNonce2, ntime, full_nonce]` —
 //!   the full 8-byte nonce is at index 4 (we grade *that*; the extraNonce2 slice
 //!   at index 2 is redundant given the full nonce).
-//! - `mining.set_extranonce` re-keys the lane mid-session.
+//! - `mining.set_extranonce` re-keys the lane mid-session;
+//!   `mining.extranonce.subscribe` is acknowledged so proxies that ask for it
+//!   (NiceHash-style) don't treat the pool as broken.
+//!
+//! Request ids are echoed back verbatim whatever their JSON type (number, string
+//! or null) — JSON-RPC allows any, and a proxy that uses string ids would
+//! otherwise never see its replies matched.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -28,23 +34,27 @@ use crate::job::Job;
 /// The subprotocol id miners announce in `mining.subscribe` and we echo back.
 pub const PROTOCOL_ID: &str = "EthereumStratum/1.0.0";
 
+/// A JSON-RPC request id: any JSON value, echoed back verbatim (`Null` when the
+/// request carried none).
+pub type RpcId = Value;
+
 /// A JSON-RPC request from a miner.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Request {
     #[serde(default)]
-    pub id: Option<u64>,
+    pub id: RpcId,
     pub method: String,
     #[serde(default)]
     pub params: Value,
 }
 
-/// A JSON-RPC response to a miner request.
+/// A JSON-RPC response to a miner request. Both `result` and `error` are always
+/// serialized (`null` when absent) — the classic Stratum envelope that strict
+/// clients expect.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Response {
-    pub id: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: RpcId,
     pub result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<Value>,
 }
 
@@ -80,26 +90,29 @@ impl Response {
 pub enum Inbound {
     /// `mining.subscribe` — user-agent + announced subprotocol.
     Subscribe {
-        id: Option<u64>,
+        id: RpcId,
         agent: Option<String>,
         protocol: Option<String>,
     },
     /// `mining.authorize` — worker name (+ optional password).
     Authorize {
-        id: Option<u64>,
+        id: RpcId,
         worker: String,
         password: Option<String>,
     },
     /// `mining.submit` — worker, job id, optional ntime, and the full 8-byte nonce.
     Submit {
-        id: Option<u64>,
+        id: RpcId,
         worker: String,
         job_id: u64,
         ntime: Option<String>,
         nonce: [u8; 8],
     },
+    /// `mining.extranonce.subscribe` — the client can accept
+    /// `mining.set_extranonce` mid-session.
+    ExtranonceSubscribe { id: RpcId },
     /// A recognised JSON-RPC frame with an unhandled method.
-    Unknown { id: Option<u64>, method: String },
+    Unknown { id: RpcId, method: String },
 }
 
 /// Why a line could not be turned into a typed [`Inbound`].
@@ -145,6 +158,7 @@ pub fn parse_inbound(line: &str) -> Result<Inbound, ProtocolError> {
                 password: str_param(&req.params, 1),
             })
         }
+        "mining.extranonce.subscribe" => Ok(Inbound::ExtranonceSubscribe { id }),
         "mining.submit" => {
             let p = &req.params;
             let worker =
@@ -173,6 +187,16 @@ pub fn parse_inbound(line: &str) -> Result<Inbound, ProtocolError> {
             method: other.to_string(),
         }),
     }
+}
+
+/// Best-effort request id of a line that failed to parse as a typed
+/// [`Inbound`], so the error reply still reaches the right pending request.
+/// `Null` if the line isn't JSON at all.
+pub fn peek_id(line: &str) -> RpcId {
+    serde_json::from_str::<Value>(line.trim())
+        .ok()
+        .and_then(|v| v.get("id").cloned())
+        .unwrap_or(Value::Null)
 }
 
 /// Fetch a string param at `idx`, if present and a string.
@@ -209,7 +233,7 @@ fn parse_nonce8(s: &str) -> Option<[u8; 8]> {
 /// subscription detail (the miner ignores it, but other clients read it as an
 /// array).
 pub fn subscribe_response(
-    id: Option<u64>,
+    id: RpcId,
     session_id: u64,
     extra_nonce1: &str,
     extra_nonce2_bytes: usize,
@@ -226,7 +250,7 @@ pub fn subscribe_response(
 }
 
 /// A `result: true` acknowledgement (e.g. authorize/submit accepted).
-pub fn ok_response(id: Option<u64>) -> Response {
+pub fn ok_response(id: RpcId) -> Response {
     Response {
         id,
         result: Some(Value::Bool(true)),
@@ -235,7 +259,7 @@ pub fn ok_response(id: Option<u64>) -> Response {
 }
 
 /// A `result: false` + `[code, message]` error frame.
-pub fn error_response(id: Option<u64>, code: i64, message: &str) -> Response {
+pub fn error_response(id: RpcId, code: i64, message: &str) -> Response {
     Response {
         id,
         result: Some(Value::Bool(false)),
@@ -264,11 +288,16 @@ pub fn boundary_decimal(target: &BigUint) -> String {
 /// target = network target × vardiff factor): params
 /// `[job_id, height, msg_hex, "", "", "", boundary, ntime, clean]`. Ergo has no
 /// per-job ntime, so it is sent empty (the miner echoes it back verbatim).
-pub fn notify(job: &Job, boundary: &BigUint) -> Notification {
+///
+/// `job_id` is the connection's **assignment** id, not [`Job::id`]: the same
+/// template re-advertised at a new difficulty gets a fresh id, so a late share
+/// for the old one is graded at the boundary it was actually mined against.
+/// `clean` tells the miner to abandon prior work (a new block height).
+pub fn notify(job_id: u64, job: &Job, boundary: &BigUint, clean: bool) -> Notification {
     Notification {
         method: "mining.notify".to_string(),
         params: json!([
-            job.id.to_string(),
+            job_id.to_string(),
             job.height,
             hex::encode(job.msg),
             "",
@@ -276,7 +305,7 @@ pub fn notify(job: &Job, boundary: &BigUint) -> Notification {
             "",
             boundary_decimal(boundary),
             "",
-            job.clean,
+            clean,
         ]),
     }
 }
@@ -302,7 +331,6 @@ mod tests {
             height: 1_500_000,
             version: 3,
             target: get_target(0x1b00_ffff),
-            clean: true,
         }
     }
 
@@ -315,7 +343,7 @@ mod tests {
         assert_eq!(
             a,
             Inbound::Subscribe {
-                id: Some(1),
+                id: json!(1),
                 agent: Some("gpu-mining-rs/0.1.0".to_string()),
                 protocol: Some("EthereumStratum/1.0.0".to_string()),
             }
@@ -325,7 +353,7 @@ mod tests {
         assert_eq!(
             b,
             Inbound::Subscribe {
-                id: Some(2),
+                id: json!(2),
                 agent: None,
                 protocol: None,
             }
@@ -340,7 +368,7 @@ mod tests {
         assert_eq!(
             i,
             Inbound::Authorize {
-                id: Some(3),
+                id: json!(3),
                 worker: "wallet.rig1".to_string(),
                 password: Some("x".to_string())
             }
@@ -358,7 +386,7 @@ mod tests {
         assert_eq!(
             i,
             Inbound::Submit {
-                id: Some(1000),
+                id: json!(1000),
                 worker: "w.r1".to_string(),
                 job_id: 7,
                 ntime: Some("".to_string()),
@@ -411,12 +439,47 @@ mod tests {
     }
 
     #[test]
+    fn string_and_missing_ids_are_preserved() {
+        let i = parse_inbound(r#"{"id":"abc","method":"mining.subscribe","params":[]}"#).unwrap();
+        assert!(matches!(i, Inbound::Subscribe { id, .. } if id == json!("abc")));
+        let i = parse_inbound(r#"{"method":"mining.subscribe","params":[]}"#).unwrap();
+        assert!(matches!(i, Inbound::Subscribe { id, .. } if id.is_null()));
+        // ...and echoed back verbatim.
+        let v: Value = serde_json::from_str(ok_response(json!("abc")).to_line().trim()).unwrap();
+        assert_eq!(v["id"], "abc");
+    }
+
+    #[test]
+    fn extranonce_subscribe_is_recognised() {
+        let i = parse_inbound(r#"{"id":3,"method":"mining.extranonce.subscribe","params":[]}"#)
+            .unwrap();
+        assert_eq!(i, Inbound::ExtranonceSubscribe { id: json!(3) });
+    }
+
+    #[test]
+    fn peek_id_recovers_the_id_of_an_unparseable_request() {
+        assert_eq!(
+            peek_id(r#"{"id":7,"method":"mining.submit","params":["w"]}"#),
+            json!(7)
+        );
+        assert_eq!(peek_id("not json"), Value::Null);
+    }
+
+    #[test]
+    fn notify_carries_the_assignment_id_and_clean_flag() {
+        let line = notify(9, &job(), &BigUint::from(5u8), false).to_line();
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["params"][0], "9");
+        assert_eq!(v["params"][8], false);
+    }
+
+    #[test]
     fn unknown_method_round_trips_as_unknown() {
         let i = parse_inbound(r#"{"id":9,"method":"mining.hello","params":[]}"#).unwrap();
         assert_eq!(
             i,
             Inbound::Unknown {
-                id: Some(9),
+                id: json!(9),
                 method: "mining.hello".to_string()
             }
         );
@@ -427,7 +490,7 @@ mod tests {
         // boundary = network target * factor; use a small synthetic target so the
         // decimal is short and exact.
         let boundary = BigUint::from(1_000_000u64);
-        let line = notify(&job(), &boundary).to_line();
+        let line = notify(42, &job(), &boundary, true).to_line();
         assert!(line.ends_with('\n'));
         let v: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(v["method"], "mining.notify");
@@ -459,12 +522,13 @@ mod tests {
 
     #[test]
     fn error_and_ok_responses_serialize() {
-        let ok = ok_response(Some(1)).to_line();
+        let ok = ok_response(json!(1)).to_line();
         let okv: Value = serde_json::from_str(ok.trim()).unwrap();
         assert_eq!(okv["result"], true);
-        assert!(okv.get("error").is_none(), "ok frame omits error");
+        assert!(okv.get("error").is_some(), "ok frame carries the error key");
+        assert_eq!(okv["error"], Value::Null, "...as null");
 
-        let er = error_response(Some(2), err::DUPLICATE, "duplicate share").to_line();
+        let er = error_response(json!(2), err::DUPLICATE, "duplicate share").to_line();
         let erv: Value = serde_json::from_str(er.trim()).unwrap();
         assert_eq!(erv["result"], false);
         assert_eq!(erv["error"][0], err::DUPLICATE);
@@ -474,7 +538,7 @@ mod tests {
     #[test]
     fn subscribe_response_advertises_the_nonce_lane() {
         let v: Value = serde_json::from_str(
-            subscribe_response(Some(1), 0xDEADBEEF, "deadbeef", 4)
+            subscribe_response(json!(1), 0xDEADBEEF, "deadbeef", 4)
                 .to_line()
                 .trim(),
         )

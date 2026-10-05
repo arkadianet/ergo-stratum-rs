@@ -1,13 +1,14 @@
-//! Pool jobs (derived from the node mining candidate) and PPLNS share weighting.
+//! Pool jobs (derived from the node mining candidate) and share weighting.
 //!
 //! A [`Job`] is one unit of work the pool hands miners: the node candidate `msg`
 //! plus the height/version that fix the Autolykos2 table, the **network target**
 //! `b` the candidate already carries (decimal big-int from `/mining/candidate`,
-//! parsed straight into a [`BigUint`] — no `nBits` round-trip), a pool-assigned
-//! `id`, and a `clean` flag (a fresh block template that obsoletes prior jobs).
-//! [`share_weight`] turns an accepted share into the difficulty it represents, so
-//! the M2 accountant weights work fairly across miners at different vardiff
-//! factors.
+//! parsed straight into a [`BigUint`] — no `nBits` round-trip), and a
+//! pool-assigned `id`. Whether a job is "clean" (miners must drop prior work) is
+//! decided per connection by the session — it is only when the height changes.
+//! [`share_weight`] turns an accepted share into the expected hashes it
+//! represents, so summed weight tracks real hashrate across workers at different
+//! vardiff factors.
 
 use num_bigint::BigUint;
 
@@ -25,12 +26,10 @@ pub struct Job {
     pub height: u32,
     /// Block version (Autolykos v1 vs v2 table rules).
     pub version: u8,
-    /// Network target `b` (a real block needs `hit <= target`). Taken verbatim
+    /// Network target `b` (a real block needs `hit < target`). Taken verbatim
     /// from the candidate — the easier per-worker share target is this scaled by
     /// the vardiff factor.
     pub target: BigUint,
-    /// New block template: drop all previously-issued jobs once this is sent.
-    pub clean: bool,
 }
 
 impl Job {
@@ -46,14 +45,14 @@ impl Job {
     }
 }
 
-/// The PPLNS weight of one accepted share found at vardiff `factor` against a job
+/// The weight (expected hashes) of one accepted share found at vardiff `factor` against a job
 /// with the given network `target`: the **share difficulty**
 /// `2^256 / (target * factor)`.
 ///
 /// A miner assigned an easier target (larger `factor`) finds shares more often but
 /// each is worth proportionally less, so summed weight tracks real hashrate
 /// regardless of each worker's assigned difficulty. The result is clamped to
-/// `[1, u64::MAX]` so the accountant's `u128` window sum can never overflow.
+/// `[1, u64::MAX]` so a `u128` running sum of weights can never overflow.
 pub fn share_weight(target: &BigUint, factor: u64) -> u128 {
     let denom = target * BigUint::from(factor.max(1));
     if denom == BigUint::ZERO {
@@ -73,20 +72,19 @@ mod tests {
 
     use ergo_crypto::difficulty::get_target;
 
-    fn job(target: BigUint, clean: bool) -> Job {
+    fn job(target: BigUint) -> Job {
         Job {
             id: 1,
             msg: [0xAB; 32],
             height: 1_500_000,
             version: 3,
             target,
-            clean,
         }
     }
 
     #[test]
     fn submission_carries_job_fields_and_nonce() {
-        let j = job(get_target(0x1b00_ffff), true);
+        let j = job(get_target(0x1b00_ffff));
         let s = j.submission([7u8; 8]);
         assert_eq!(s.msg, j.msg);
         assert_eq!(s.nonce, [7u8; 8]);
@@ -128,7 +126,7 @@ mod tests {
     #[test]
     fn weight_never_exceeds_u64_max_for_safe_summation() {
         // An absurdly hard target would overflow share difficulty; the clamp keeps
-        // it within u64 so the accountant's u128 window sum can't overflow.
+        // it within u64 so a u128 running sum can't overflow.
         let w = share_weight(&get_target(0x1b00_ffff), 1);
         assert!(w <= u128::from(u64::MAX));
     }
