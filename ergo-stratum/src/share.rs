@@ -22,30 +22,33 @@ pub struct Submission {
     pub height: u32,
     /// Block version (Autolykos v1 vs v2 table rules).
     pub version: u8,
-    /// Network target `b` (a real block needs `hit <= target`).
+    /// Network target `b` (a real block needs `hit < target`).
     pub target: BigUint,
 }
 
 /// Where a submission falls relative to the network and pool-share targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShareClass {
-    /// `hit <= network_target` — a real block. Submit it to the node.
+    /// `hit < network_target` — a real block. Submit it to the node.
     Block,
-    /// `network_target < hit <= share_target` — a valid pool share (counts).
+    /// `network_target <= hit < share_target` — a valid pool share (counts).
     Share,
-    /// `hit > share_target` — below the pool's share difficulty. Reject.
+    /// `hit >= share_target` — below the pool's share difficulty. Reject.
     BelowTarget,
 }
 
 /// Pure threshold classification given a computed `hit` and the network target.
 /// `share_factor` (>= 1) makes the share target easier:
 /// `share_target = network_target * share_factor`.
+///
+/// Both bounds are **strict** (`hit < target`), matching the node's consensus
+/// `check_pow_v2` exactly — a hit equal to the network target is not a block.
 pub fn classify_hit(hit: &BigUint, network_target: &BigUint, share_factor: u64) -> ShareClass {
-    if hit <= network_target {
+    if hit < network_target {
         return ShareClass::Block;
     }
     let share_target = network_target * BigUint::from(share_factor.max(1));
-    if hit <= &share_target {
+    if hit < &share_target {
         ShareClass::Share
     } else {
         ShareClass::BelowTarget
@@ -72,20 +75,31 @@ mod tests {
 
     // ----- happy path: pure threshold logic -----
     #[test]
-    fn hit_at_or_below_network_target_is_a_block() {
+    fn hit_below_network_target_is_a_block() {
         assert_eq!(classify_hit(&big(5), &big(10), 100), ShareClass::Block);
-        assert_eq!(classify_hit(&big(10), &big(10), 100), ShareClass::Block); // boundary inclusive
+        assert_eq!(classify_hit(&big(9), &big(10), 100), ShareClass::Block);
+    }
+
+    #[test]
+    fn hit_equal_to_network_target_is_not_a_block_matching_consensus() {
+        // Consensus `check_pow_v2` is strict (`hit < target`): equality is NOT a
+        // block, so it must not be POSTed as one. It is still a valid share.
+        assert_eq!(classify_hit(&big(10), &big(10), 100), ShareClass::Share);
     }
 
     #[test]
     fn hit_within_share_band_is_a_share() {
         // target 10, factor 10 -> share_target 100. hit 50 is a share.
         assert_eq!(classify_hit(&big(50), &big(10), 10), ShareClass::Share);
-        assert_eq!(classify_hit(&big(100), &big(10), 10), ShareClass::Share); // boundary inclusive
+        assert_eq!(classify_hit(&big(99), &big(10), 10), ShareClass::Share);
     }
 
     #[test]
-    fn hit_above_share_target_is_rejected() {
+    fn hit_at_or_above_share_target_is_rejected() {
+        assert_eq!(
+            classify_hit(&big(100), &big(10), 10),
+            ShareClass::BelowTarget
+        );
         assert_eq!(
             classify_hit(&big(101), &big(10), 10),
             ShareClass::BelowTarget
@@ -96,8 +110,8 @@ mod tests {
     #[test]
     fn share_factor_one_collapses_share_band_to_block_or_reject() {
         // factor 1 -> share_target == network_target; nothing is a Share.
-        assert_eq!(classify_hit(&big(10), &big(10), 1), ShareClass::Block);
-        assert_eq!(classify_hit(&big(11), &big(10), 1), ShareClass::BelowTarget);
+        assert_eq!(classify_hit(&big(9), &big(10), 1), ShareClass::Block);
+        assert_eq!(classify_hit(&big(10), &big(10), 1), ShareClass::BelowTarget);
     }
 
     #[test]

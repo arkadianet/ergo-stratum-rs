@@ -2,9 +2,9 @@
 //!
 //! The daemon polls `/mining/candidate` on a timer; most polls return the *same*
 //! template. [`JobSource::make_job`] emits a fresh [`Job`] only when the candidate
-//! message changes (new work), assigning a monotonically increasing job id. Every
-//! emitted job is a new template, so it carries `clean = true` (miners drop prior
-//! work and restart their nonce search).
+//! message changes (new work), assigning a monotonically increasing job id.
+//! Whether miners must drop prior work is decided per connection by the session
+//! (only on a height change — the node refreshes templates within a height).
 
 use ergo_stratum::Job;
 
@@ -43,8 +43,19 @@ impl JobSource {
             height: candidate.height,
             version: self.block_version,
             target: candidate.target.clone(),
-            clean: true,
         })
+    }
+
+    /// The `msg` of the last job issued (what a long-poll waits on).
+    pub fn last_msg(&self) -> Option<[u8; 32]> {
+        self.last_msg
+    }
+
+    /// Forget the last template so the next candidate is issued even if it is
+    /// unchanged — used after work was withdrawn (node outage), when miners hold
+    /// no job and must be handed one again.
+    pub fn reset(&mut self) {
+        self.last_msg = None;
     }
 }
 
@@ -63,11 +74,10 @@ mod tests {
     }
 
     #[test]
-    fn first_candidate_emits_a_clean_job_with_id_one() {
+    fn first_candidate_emits_a_job_with_id_one() {
         let mut src = JobSource::new(3);
         let j = src.make_job(&candidate(0xAA, 1000)).expect("new work");
         assert_eq!(j.id, 1);
-        assert!(j.clean);
         assert_eq!(j.version, 3);
         assert_eq!(j.msg, [0xAA; 32]);
         assert_eq!(j.height, 1000);
@@ -90,7 +100,19 @@ mod tests {
         assert_eq!(a.id, 1);
         assert_eq!(b.id, 2);
         assert_eq!(b.msg, [0xBB; 32]);
-        assert!(b.clean);
+        assert_eq!(src.last_msg(), Some([0xBB; 32]));
+    }
+
+    #[test]
+    fn reset_reissues_an_unchanged_template() {
+        let mut src = JobSource::new(3);
+        src.make_job(&candidate(0xAA, 1000)).unwrap();
+        assert!(src.make_job(&candidate(0xAA, 1000)).is_none());
+        src.reset();
+        let again = src
+            .make_job(&candidate(0xAA, 1000))
+            .expect("reissued after reset");
+        assert_eq!(again.id, 2);
     }
 
     #[test]
