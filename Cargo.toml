@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 num-bigint = "0.4"
+num-traits = "0.2"
 serde      = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 hex        = "0.4"

@@ -38,6 +38,9 @@ use crate::vardiff::VarDiff;
 /// actually are). Matches the depth of the node's own retained-template ring.
 pub const RECENT_ASSIGNMENTS: usize = 16;
 
+/// Longest miner user-agent kept (it is logged and matched, never trusted).
+pub const MAX_AGENT_LEN: usize = 64;
+
 /// Handshake state of a session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionState {
@@ -114,6 +117,8 @@ impl Assignment {
 pub struct Session {
     state: SessionState,
     worker: Option<String>,
+    /// The miner software's self-description from `mining.subscribe`.
+    agent: Option<String>,
     /// The connection's assigned nonce lane (extraNonce partitioning + anti-cheat).
     extra_nonce: ExtraNonce,
     vardiff: VarDiff,
@@ -137,6 +142,7 @@ impl Session {
         Self {
             state: SessionState::Connected,
             worker: None,
+            agent: None,
             extra_nonce,
             vardiff,
             latest_job: None,
@@ -154,6 +160,30 @@ impl Session {
 
     pub fn worker(&self) -> Option<&str> {
         self.worker.as_deref()
+    }
+
+    /// Record the user-agent a miner announced in `mining.subscribe`, reduced to
+    /// printable ASCII and capped at [`MAX_AGENT_LEN`] (it ends up in logs).
+    pub fn set_agent(&mut self, agent: &str) {
+        let clean: String = agent
+            .chars()
+            .filter(|c| c.is_ascii_graphic() || *c == ' ')
+            .take(MAX_AGENT_LEN)
+            .collect();
+        self.agent = (!clean.is_empty()).then_some(clean);
+    }
+
+    /// The miner's announced user-agent, if any.
+    pub fn agent(&self) -> Option<&str> {
+        self.agent.as_deref()
+    }
+
+    /// NiceHash's proxy reads `mining.set_difficulty` in its own units (it
+    /// identifies itself in the subscribe user-agent).
+    pub fn is_nicehash(&self) -> bool {
+        self.agent
+            .as_deref()
+            .is_some_and(|a| a.to_ascii_lowercase().contains("nicehash"))
     }
 
     /// The connection's assigned nonce lane (for building the subscribe response /
@@ -439,6 +469,21 @@ mod tests {
         assert!(!s.authorize("someone.else"), "a different name is refused");
         assert_eq!(s.worker(), Some("miner.worker1"));
         assert_eq!(s.state(), SessionState::Authorized);
+    }
+
+    #[test]
+    fn agent_is_sanitized_capped_and_used_to_spot_nicehash() {
+        let mut s = Session::new(ExtraNonce::whole(), vd());
+        assert_eq!(s.agent(), None);
+        assert!(!s.is_nicehash());
+        s.set_agent("Rigel/1.23.2\n\u{7}");
+        assert_eq!(s.agent(), Some("Rigel/1.23.2"));
+        s.set_agent(&"x".repeat(500));
+        assert_eq!(s.agent().map(str::len), Some(MAX_AGENT_LEN));
+        s.set_agent("NiceHash/1.0.0");
+        assert!(s.is_nicehash());
+        s.set_agent("\n");
+        assert_eq!(s.agent(), None, "nothing printable -> no agent");
     }
 
     #[test]

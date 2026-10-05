@@ -90,6 +90,7 @@ Every flag has an `ERGO_SOLO_*` environment equivalent.
 | `--vardiff-initial/min/max` | network-based | override the share-difficulty envelope (validated at startup) |
 | `--vardiff-interval` | `15` | target seconds between shares per worker |
 | `--stratum-password` | — | require this password in `mining.authorize`; set it before exposing the port |
+| `--no-set-difficulty` | off | stop sending `mining.set_difficulty` before each job (see below) |
 | `--max-msgs-per-sec` | `0` (off) | control-message flood cap (share submits are never counted) |
 | `--max-invalid-per-min` | `0` (off) | drop a connection sending more invalid shares than this per minute (stale shares don't count) |
 | `--max-connections` | `1024` | global connection cap |
@@ -184,12 +185,20 @@ to do first:
   what you paid for. Over an hour at ~15 s/share the estimate is good to roughly
   ±6%; shorter windows are noisier.
 
-Caveats: compatibility with NiceHash / MiningRigRentals proxies has **not** been
-verified (run their pool checkers first); `mining.set_difficulty` and runtime
-`mining.set_extranonce` are not implemented; there is no TLS (terminate it in front
-with e.g. stunnel or haproxy if the service requires `stratum+ssl`). And remember
-solo mining with rented hashrate is a lottery — expected value is usually at or
-below the rental price, with large variance.
+Every job is preceded by `mining.set_difficulty`, as rental proxies expect
+(MiningRigRentals' pool test fails without it). Following Miningcore's Ergo
+convention the value is `1`, because the real share target is already in the
+job; a client that announces itself as NiceHash instead gets the share
+difficulty in NiceHash's units. `--no-set-difficulty` turns this off if a miner
+ever misbehaves on receiving it.
+
+Caveats: compatibility with NiceHash / MiningRigRentals proxies is still to be
+proven end-to-end (run their pool checkers, then a short rental, and compare the
+service's hashrate figure with ours); runtime `mining.set_extranonce` is not
+implemented; there is no TLS (terminate it in front with e.g. stunnel or haproxy if
+the service requires `stratum+ssl`). And remember solo mining with rented hashrate
+is a lottery — expected value is usually at or below the rental price, with large
+variance.
 
 ## Building from source
 

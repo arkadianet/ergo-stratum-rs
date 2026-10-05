@@ -32,7 +32,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::codec::{FramedRead, LinesCodec};
 
-use ergo_stratum::protocol::notify;
+use ergo_stratum::protocol::{nicehash_difficulty, notify, set_difficulty};
 use ergo_stratum::session::SessionState;
 use ergo_stratum::{Assignment, ExtraNonce, Job, LanePool, Session};
 
@@ -323,6 +323,7 @@ pub async fn serve(
             limiter: RateLimiter::new(config.max_msgs_per_sec, Duration::from_secs(1), now),
             invalid: RateLimiter::new(config.max_invalid_per_min, Duration::from_secs(60), now),
             worker: None,
+            send_difficulty: config.set_difficulty,
         };
         tokio::spawn(async move {
             // Released when the task ends.
@@ -634,6 +635,18 @@ struct Connection {
     invalid: RateLimiter,
     /// The login this connection is counted under in [`Stats`].
     worker: Option<String>,
+    /// Precede every job with `mining.set_difficulty`.
+    send_difficulty: bool,
+}
+
+/// Which `mining.set_difficulty` (if any) precedes a job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DifficultyMsg {
+    Off,
+    /// `[1]`: the share target is in the notify itself (Miningcore convention).
+    Unit,
+    /// NiceHash units, derived from the job's share target.
+    NiceHash,
 }
 
 impl Connection {
@@ -647,6 +660,16 @@ impl Connection {
 
     fn now(&self) -> f64 {
         self.start.elapsed().as_secs_f64()
+    }
+
+    fn difficulty_msg(&self) -> DifficultyMsg {
+        if !self.send_difficulty {
+            DifficultyMsg::Off
+        } else if self.session.is_nicehash() {
+            DifficultyMsg::NiceHash
+        } else {
+            DifficultyMsg::Unit
+        }
     }
 
     fn authorized(&self) -> bool {
@@ -680,7 +703,7 @@ impl Connection {
                             no_work_since = None;
                             let now = self.now();
                             if let Some(a) = self.session.assign_job(job, now) {
-                                send_notify(&mut write, &a).await?;
+                                send_job(&mut write, &a, self.difficulty_msg()).await?;
                             }
                         }
                         None => {
@@ -798,13 +821,14 @@ impl Connection {
                 peer = %self.peer,
                 session_id = self.ctx.session_id,
                 %worker,
+                agent = self.session.agent().unwrap_or("-"),
                 factor = self.session.factor(),
                 "miner authorized"
             );
             let job = self.job_rx.borrow_and_update().clone();
             if let Some(job) = job {
                 if let Some(a) = self.session.assign_job(job, now) {
-                    send_notify(write, &a).await?;
+                    send_job(write, &a, self.difficulty_msg()).await?;
                 }
             }
         }
@@ -827,21 +851,29 @@ impl Connection {
                 factor = a.factor,
                 "vardiff retarget"
             );
-            send_notify(write, &a).await?;
+            send_job(write, &a, self.difficulty_msg()).await?;
         }
         Ok(())
     }
 }
 
-async fn send_notify(
+/// Send one assignment: `mining.set_difficulty` (per `difficulty`) immediately
+/// followed by its `mining.notify`, in a single write. The order matters —
+/// some miners apply whichever of the two arrives last, and the notify carries
+/// the real share target.
+async fn send_job(
     write: &mut (impl AsyncWriteExt + Unpin),
     a: &Assignment,
+    difficulty: DifficultyMsg,
 ) -> std::io::Result<()> {
-    write_frame(
-        write,
-        &notify(a.id, &a.job, &a.boundary(), a.clean).to_line(),
-    )
-    .await
+    let boundary = a.boundary();
+    let mut frames = match difficulty {
+        DifficultyMsg::Off => String::new(),
+        DifficultyMsg::Unit => set_difficulty(1.0).to_line(),
+        DifficultyMsg::NiceHash => set_difficulty(nicehash_difficulty(&boundary)).to_line(),
+    };
+    frames.push_str(&notify(a.id, &a.job, &boundary, a.clean).to_line());
+    write_frame(write, &frames).await
 }
 
 async fn write_frame(write: &mut (impl AsyncWriteExt + Unpin), frame: &str) -> std::io::Result<()> {
@@ -1072,6 +1104,7 @@ mod e2e {
                 interval_secs: 15.0,
             },
             stratum_password: None,
+            set_difficulty: true,
             max_msgs_per_sec: 0,
             max_invalid_per_min: 0,
             max_connections: 16,
@@ -1139,18 +1172,27 @@ mod e2e {
             }
         }
 
-        /// Subscribe + authorize; returns the first `mining.notify`.
-        async fn handshake(&mut self) -> Value {
-            self.send(json!({"id": 1, "method": "mining.subscribe", "params": ["test/1.0", "EthereumStratum/1.0.0"]}))
+        /// Subscribe (as `agent`) + authorize; every frame up to and including
+        /// the first `mining.notify`.
+        async fn handshake_as(&mut self, agent: &str) -> Vec<Value> {
+            self.send(json!({"id": 1, "method": "mining.subscribe", "params": [agent, "EthereumStratum/1.0.0"]}))
                 .await;
             self.send(json!({"id": 2, "method": "mining.authorize", "params": ["rig", "x"]}))
                 .await;
+            let mut frames = Vec::new();
             loop {
                 let frame = self.recv().await.expect("connection open");
-                if frame["method"] == "mining.notify" {
-                    return frame;
+                let done = frame["method"] == "mining.notify";
+                frames.push(frame);
+                if done {
+                    return frames;
                 }
             }
+        }
+
+        /// Subscribe + authorize; returns the first `mining.notify`.
+        async fn handshake(&mut self) -> Value {
+            self.handshake_as("test/1.0").await.pop().unwrap()
         }
     }
 
@@ -1186,6 +1228,50 @@ mod e2e {
         for body in node.solutions.lock().unwrap().iter() {
             assert!(body.contains("0a0b0c0d0e0f1011"), "{body}");
         }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn every_job_is_preceded_by_set_difficulty() {
+        let node = Arc::new(MockNode::default());
+        *node.candidate.lock().unwrap() = Some(candidate_body());
+        let server = start_server(test_config(spawn_mock_node(node.clone()).await)).await;
+
+        // A regular miner gets `[1]` immediately before the notify...
+        let mut miner = Miner::connect(server.addr).await;
+        let frames = miner.handshake_as("Rigel/1.23.2").await;
+        let n = frames.len();
+        assert!(n >= 2, "{frames:?}");
+        assert_eq!(frames[n - 2]["method"], "mining.set_difficulty");
+        assert_eq!(frames[n - 2]["params"], json!([1]));
+        assert_eq!(frames[n - 1]["method"], "mining.notify");
+
+        // ...NiceHash gets the share difficulty in its own units, derived from
+        // the job's share target: network target 2^256 x vardiff factor 1000.
+        let mut nicehash = Miner::connect(server.addr).await;
+        let frames = nicehash.handshake_as("NiceHash/1.0.0").await;
+        let set = &frames[frames.len() - 2];
+        assert_eq!(set["method"], "mining.set_difficulty");
+        let d = set["params"][0].as_f64().unwrap();
+        let share_target =
+            (num_bigint::BigUint::from(1u8) << 256u32) * num_bigint::BigUint::from(1000u32);
+        let want = nicehash_difficulty(&share_target);
+        assert!((d / want - 1.0).abs() < 1e-9, "{d} vs {want}");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn set_difficulty_can_be_disabled() {
+        let node = Arc::new(MockNode::default());
+        *node.candidate.lock().unwrap() = Some(candidate_body());
+        let mut config = test_config(spawn_mock_node(node.clone()).await);
+        config.set_difficulty = false;
+        let server = start_server(config).await;
+        let mut miner = Miner::connect(server.addr).await;
+        let frames = miner.handshake_as("Rigel/1.23.2").await;
+        assert!(frames
+            .iter()
+            .all(|f| f["method"] != "mining.set_difficulty"));
         server.shutdown().await;
     }
 

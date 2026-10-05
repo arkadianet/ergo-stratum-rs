@@ -112,6 +112,13 @@ pub struct Cli {
     #[arg(long, env = "ERGO_SOLO_STRATUM_PASSWORD")]
     pub stratum_password: Option<String>,
 
+    /// Don't send `mining.set_difficulty` before each job. By default it is sent
+    /// (value 1 — the share target is in the job itself — or NiceHash units for
+    /// NiceHash), as Miningcore does and as rental proxies (MiningRigRentals)
+    /// require. Only disable it if a miner misbehaves on receiving it.
+    #[arg(long, env = "ERGO_SOLO_NO_SET_DIFFICULTY", default_value_t = false)]
+    pub no_set_difficulty: bool,
+
     /// Inbound non-share message flood cap per second (0 = off, the solo default —
     /// share submissions are never counted, vardiff governs those).
     #[arg(long, env = "ERGO_SOLO_MAX_MSGS_PER_SEC", default_value_t = 0)]
@@ -173,6 +180,8 @@ pub struct Config {
     pub partition_bytes: Option<usize>,
     pub vardiff: VardiffCfg,
     pub stratum_password: Option<String>,
+    /// Send `mining.set_difficulty` before every `mining.notify`.
+    pub set_difficulty: bool,
     pub max_msgs_per_sec: u32,
     pub max_invalid_per_min: u32,
     pub max_connections: usize,
@@ -229,6 +238,7 @@ impl Config {
             partition_bytes: cli.partition.then_some(usize::from(cli.partition_bytes)),
             vardiff,
             stratum_password: cli.stratum_password.filter(|p| !p.is_empty()),
+            set_difficulty: !cli.no_set_difficulty,
             max_msgs_per_sec: cli.max_msgs_per_sec,
             max_invalid_per_min: cli.max_invalid_per_min,
             max_connections: cli.max_connections,
@@ -318,6 +328,12 @@ mod tests {
         let c = cfg(&["--no-longpoll", "--stale-work-secs", "0"]);
         assert!(!c.longpoll);
         assert_eq!(c.stale_work, None);
+    }
+
+    #[test]
+    fn set_difficulty_is_on_by_default_and_can_be_disabled() {
+        assert!(cfg(&[]).set_difficulty);
+        assert!(!cfg(&["--no-set-difficulty"]).set_difficulty);
     }
 
     #[test]

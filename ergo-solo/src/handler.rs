@@ -71,8 +71,11 @@ pub fn handle_line(session: &mut Session, ctx: &LineCtx, line: &str, now_secs: f
     };
 
     match inbound {
-        Inbound::Subscribe { id, .. } => {
+        Inbound::Subscribe { id, agent, .. } => {
             session.subscribe();
+            if let Some(agent) = agent {
+                session.set_agent(&agent);
+            }
             let ex = session.extra_nonce();
             reply(
                 subscribe_response(
