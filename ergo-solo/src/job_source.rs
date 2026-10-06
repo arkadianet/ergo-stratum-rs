@@ -4,7 +4,7 @@
 //! template. [`JobSource::make_job`] emits a fresh [`Job`] only when the candidate
 //! message changes (new work), assigning a monotonically increasing job id.
 //! Whether miners must drop prior work is decided per connection by the session
-//! (only on a height change — the node refreshes templates within a height).
+//! (on every template change, so miners always work the richest template).
 
 use ergo_stratum::Job;
 

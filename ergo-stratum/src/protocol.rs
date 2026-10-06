@@ -299,7 +299,7 @@ pub fn boundary_decimal(target: &BigUint) -> String {
 /// `job_id` is the connection's **assignment** id, not [`Job::id`]: the same
 /// template re-advertised at a new difficulty gets a fresh id, so a late share
 /// for the old one is graded at the boundary it was actually mined against.
-/// `clean` tells the miner to abandon prior work (a new block height).
+/// `clean` tells the miner to abandon prior work (a new template).
 pub fn notify(job_id: u64, job: &Job, boundary: &BigUint, clean: bool) -> Notification {
     Notification {
         method: "mining.notify".to_string(),

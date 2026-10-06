@@ -132,11 +132,13 @@ modern rig and floods stale rejects (this is what the old 4-byte default did).
   new block reaches miners immediately. Other nodes answer at once and are polled
   every `--poll-secs`. A fresh Stratum job is emitted only when the template
   changes.
-- Miners are told to drop their work (`clean_jobs`) only when the **height**
-  changes. The node refreshes its template several times per block (an empty one
-  first, then with transactions) and accepts solutions for recent ones, so shares
-  for any recent template at the current height are still graded — and a block
-  found on one is still submitted.
+- Every new template is sent with `clean_jobs` set, so miners move onto it at
+  once. The node publishes an empty template first at each new height, then
+  refreshes it with transactions and storage-rent claims. Those fees and claims
+  can be worth more than the miner's share of the emission, so a block found on
+  the empty template is a cheap block. Shares for any recent template at the
+  current height are still graded, and a block found on one is still
+  submitted, so dropping old work costs nothing.
 - Each connection gets a **vardiff** controller that judges the share rate over a
   window (8 shares, or 8 target intervals) and eases a worker that has gone quiet;
   share targets adapt so any GPU (or a whole farm) sits near one share every ~15s.
