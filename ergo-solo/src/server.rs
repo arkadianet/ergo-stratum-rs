@@ -1304,6 +1304,35 @@ mod e2e {
     }
 
     #[tokio::test]
+    async fn a_same_height_template_refresh_is_sent_clean() {
+        // The node's first template at a height is empty; its refresh adds fees
+        // and rent claims. Miners must be told to drop the empty one.
+        let node = Arc::new(MockNode::default());
+        *node.candidate.lock().unwrap() = Some(candidate_body());
+        let server = start_server(test_config(spawn_mock_node(node.clone()).await)).await;
+
+        let mut miner = Miner::connect(server.addr).await;
+        let first = miner.handshake().await;
+        assert_eq!(first["params"][2], MSG_HEX);
+
+        let refreshed_msg = "22".repeat(32);
+        let b = num_bigint::BigUint::from(1u8) << 256;
+        *node.candidate.lock().unwrap() = Some(format!(
+            r#"{{"msg":"{refreshed_msg}","b":{b},"h":1000,"pk":null}}"#
+        ));
+        let refresh = loop {
+            let frame = miner.recv().await.expect("connection open");
+            if frame["method"] == "mining.notify" {
+                break frame;
+            }
+        };
+        assert_eq!(refresh["params"][2], refreshed_msg.as_str());
+        assert_eq!(refresh["params"][1], first["params"][1], "same height");
+        assert_eq!(refresh["params"][8], true, "a template change is clean");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn candidates_are_long_polled_with_the_held_template() {
         let node = Arc::new(MockNode::default());
         *node.candidate.lock().unwrap() = Some(candidate_body());

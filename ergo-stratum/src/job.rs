@@ -5,7 +5,7 @@
 //! `b` the candidate already carries (decimal big-int from `/mining/candidate`,
 //! parsed straight into a [`BigUint`] — no `nBits` round-trip), and a
 //! pool-assigned `id`. Whether a job is "clean" (miners must drop prior work) is
-//! decided per connection by the session — it is only when the height changes.
+//! decided per connection by the session — it is whenever the template changes.
 //! [`share_weight`] turns an accepted share into the expected hashes it
 //! represents, so summed weight tracks real hashrate across workers at different
 //! vardiff factors.

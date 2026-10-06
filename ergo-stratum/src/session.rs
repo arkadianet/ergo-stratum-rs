@@ -24,6 +24,16 @@
 //! empty one, then refreshes as the mempool changes) and accepts solutions for
 //! recent ones, so any of the last [`RECENT_ASSIGNMENTS`] assignments at the
 //! *current height* stays gradeable. Work for an older height is truly stale.
+//!
+//! **Clean jobs.** Every template change is sent with `clean = true`, so the
+//! miner moves to the newest template at once. The templates differ in value:
+//! the node's first one at a new height is empty (emission only), and the
+//! refreshes add fees and storage-rent claims that can be worth more than the
+//! miner's share of the emission. Some miners keep working a job sent with
+//! `clean = false`, and a block found there pays the emission alone. Since
+//! older same-height assignments stay gradeable, dropping them costs nothing.
+//! Only re-advertising the *same* template (a difficulty change) is `clean =
+//! false`.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -102,7 +112,7 @@ pub struct Assignment {
     pub job: Job,
     /// Share factor advertised with this assignment (`boundary = target * factor`).
     pub factor: u64,
-    /// Whether the miner must abandon prior work (the height changed).
+    /// Whether the miner must abandon prior work (the template changed).
     pub clean: bool,
 }
 
@@ -272,10 +282,10 @@ impl Session {
             return None;
         }
         let job = self.latest_job.clone()?;
-        let clean = self
-            .assignments
-            .back()
-            .is_none_or(|a| a.job.height != job.height);
+        // Any template change is clean (see the module docs): a miner left on
+        // an older template can find a block that misses its fees and rent
+        // claims. The same template re-advertised (a new difficulty) is not.
+        let clean = self.assignments.back().is_none_or(|a| a.job.msg != job.msg);
         let assignment = Assignment {
             id: self.next_assignment_id,
             job,
@@ -510,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_only_when_the_height_changes() {
+    fn clean_whenever_the_template_changes() {
         let mut s = authed();
         let a1 = s
             .assign_job(job_at(1, 0xA, 100, hard_target()), 0.0)
@@ -521,13 +531,23 @@ mod tests {
         let a3 = s
             .assign_job(job_at(3, 0xC, 101, hard_target()), 2.0)
             .unwrap();
-        assert!(a1.clean);
+        assert!(a1.clean, "a connection's first job is clean");
         assert!(
-            !a2.clean,
-            "same-height template refresh must not restart miners"
+            a2.clean,
+            "a same-height refresh (e.g. empty -> with fees and rent claims) must move miners onto it"
         );
-        assert!(a3.clean, "new height must");
+        assert!(a3.clean, "a new height is clean");
         assert_eq!((a1.id, a2.id, a3.id), (1, 2, 3));
+    }
+
+    #[test]
+    fn re_advertising_the_same_template_is_not_clean() {
+        let mut s = authed();
+        s.assign_job(job_at(1, 0xA, 100, hard_target()), 0.0)
+            .unwrap();
+        // Same template again (e.g. a difficulty change re-advertisement).
+        let again = s.issue(1.0).expect("re-issue");
+        assert!(!again.clean, "nothing to abandon: the work is unchanged");
     }
 
     #[test]
